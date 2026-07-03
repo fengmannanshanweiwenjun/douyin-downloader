@@ -81,13 +81,13 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
     <p>支持视频 · 图文 · 一键保存到本地</p>
   </div>
   <div class="input-group">
-    <input type="text" id="urlInput" placeholder="粘贴抖音分享链接或分享文字..." autocomplete="off" spellcheck="false">
+    <input type="text" id="urlInput" placeholder="粘贴抖音分享链接或分享口令文字..." autocomplete="off" spellcheck="false">
     <button class="btn-parse" id="parseBtn" onclick="doParse()">
       <span class="btn-text">解析</span>
       <span class="spinner"></span>
     </button>
   </div>
-  <div class="tip">打开抖音 → 分享 → 复制链接 → 粘贴到上方</div>
+  <div class="tip">打开抖音 → 分享 → 复制链接或口令 → 粘贴到上方</div>
   <div class="error-msg" id="errorMsg"></div>
   <div class="result" id="result">
     <div class="result-card">
@@ -119,6 +119,56 @@ const $ = id => document.getElementById(id);
 const urlInput = $('urlInput');
 const parseBtn = $('parseBtn');
 const PROXY = 'https://corsproxy.io/?';
+
+// 从分享文本中提取可用的链接或短码
+function extractShareCode(text) {
+  text = text.trim();
+  // 1. 标准 URL
+  const urlMatch = text.match(/https?:\/\/[^\s<>"']+/);
+  if (urlMatch) return { type: 'url', value: urlMatch[0] };
+
+  // 2. 抖音分享口令：数字.xx:/ 短码 ...
+  //    例如 "8.99 caa:/ K@j.ca 04/30 :7pm 我眼中的世界"
+  //    短码格式：字母数字+@+字母数字.字母
+  const codeMatch = text.match(/\d+\.\d+\s+[a-z]+:\/\s+([A-Za-z0-9@.]+)/);
+  if (codeMatch) return { type: 'code', value: codeMatch[1] };
+
+  // 3. 任何 v.douyin.com 风格
+  const vdyMatch = text.match(/v\.douyin\.com\/[A-Za-z0-9]+/);
+  if (vdyMatch) return { type: 'url', value: 'https://' + vdyMatch[0] };
+
+  // 4. 尝试提取所有看起来像短码的片段
+  const anyCode = text.match(/([A-Za-z0-9]{2,}@[A-Za-z0-9]+\.[A-Za-z]{2,})/);
+  if (anyCode) return { type: 'code', value: anyCode[1] };
+
+  // 5. 尝试作为纯链接处理
+  return { type: 'url', value: text };
+}
+
+// 通过抖音分享接口解析短码
+async function resolveShareCode(code) {
+  // 尝试多种方式构建可访问的URL
+  const attempts = [
+    `https://v.douyin.com/${code}/`,
+    `https://www.iesdouyin.com/share/video/${code}`,
+    `https://www.douyin.com/video/${code}`,
+  ];
+
+  for (const tryUrl of attempts) {
+    try {
+      const pageContent = await resolveRedirect(tryUrl);
+      const vid = extractVideoId(pageContent);
+      if (vid) return { videoId: vid, pageContent };
+      // 如果返回了有用的图片或视频URL，也直接用
+      const imgs = extractImageUrls(pageContent);
+      const vUrl = extractVideoUrl(pageContent);
+      if (imgs.length > 0 || vUrl) return { videoId: null, pageContent };
+    } catch (e) {
+      console.log('尝试失败:', tryUrl, e.message);
+    }
+  }
+  return null;
+}
 
 // 回车解析
 urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') doParse(); });
@@ -241,28 +291,57 @@ async function doParse() {
   try {
     showToast('正在解析链接...');
 
-    // Step 1: 获取页面内容
+    // Step 1: 智能提取分享信息
+    const share = extractShareCode(raw);
+    console.log('提取结果:', share);
+
     let pageContent = '';
     let videoId = null;
 
-    // 先尝试直接从链接提取ID
-    videoId = extractVideoId(url);
-
-    if (!videoId) {
-      // 短链需要解析
-      showToast('正在获取作品信息...');
-      pageContent = await resolveRedirect(url);
-      videoId = extractVideoId(pageContent);
+    if (share.type === 'url') {
+      // 标准URL流程
+      videoId = extractVideoId(share.value);
+      if (!videoId) {
+        showToast('正在获取作品信息...');
+        pageContent = await resolveRedirect(share.value);
+        videoId = extractVideoId(pageContent);
+      }
+    } else if (share.type === 'code') {
+      // 短码流程：尝试多种方式解析
+      showToast('正在解析分享口令...');
+      const resolved = await resolveShareCode(share.value);
+      if (resolved) {
+        videoId = resolved.videoId;
+        pageContent = resolved.pageContent;
+      }
     }
 
-    if (!videoId) throw new Error('无法提取作品ID，请确认链接正确');
+    if (!videoId) {
+      // 最后尝试：直接从原始文本中提取ID
+      videoId = extractVideoId(raw);
+    }
+
+    if (!videoId) {
+      // 检查是否已经在pageContent中找到了媒体资源
+      if (pageContent) {
+        const imgs = extractImageUrls(pageContent);
+        const vUrl = extractVideoUrl(pageContent);
+        if (imgs.length === 0 && !vUrl) {
+          throw new Error('无法解析该分享内容。请确保复制的是完整的抖音分享链接（以 http 或 v.douyin.com 开头的链接）');
+        }
+      } else {
+        throw new Error('无法解析该分享内容。请确保复制的是完整的抖音分享链接（以 http 或 v.douyin.com 开头的链接）');
+      }
+    }
 
     // Step 2: 获取作品详情页
-    showToast('正在提取下载地址...');
-    const detailUrl = `https://www.douyin.com/video/${videoId}`;
     let detailContent = pageContent;
-    if (!detailContent || !detailContent.includes(videoId)) {
-      detailContent = await resolveRedirect(detailUrl);
+    if (videoId) {
+      showToast('正在提取下载地址...');
+      const detailUrl = `https://www.douyin.com/video/${videoId}`;
+      if (!detailContent || !detailContent.includes(videoId)) {
+        detailContent = await resolveRedirect(detailUrl);
+      }
     }
 
     // Step 3: 提取信息
